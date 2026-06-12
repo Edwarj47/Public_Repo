@@ -1,7 +1,7 @@
 # backend/app/models.py
 from sqlalchemy import (
     Column, String, DateTime, ForeignKey, BigInteger, Boolean, Enum, Text,
-    Integer, Numeric
+    Integer, Numeric, UniqueConstraint
 )
 from sqlalchemy.dialects.mssql import UNIQUEIDENTIFIER
 from sqlalchemy.sql import func
@@ -21,6 +21,7 @@ class TenantPlan(str, enum.Enum):
 
 
 class UserRole(str, enum.Enum):
+    owner = "owner"
     admin = "admin"
     user = "user"
 
@@ -53,7 +54,68 @@ class User(Base):
     role = Column(Enum(UserRole), nullable=False, server_default="user")
     is_active = Column(Boolean, nullable=False, server_default="1")
     ai_enabled = Column(Boolean, nullable=False, server_default="1")
+    confirm_file_delete = Column(Boolean, nullable=False, server_default="1")
+    recycle_bin_retention_days = Column(Integer, nullable=False, server_default="30")
+    theme_preference = Column(String(10), nullable=False, server_default="light")
 
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.sysutcdatetime())
+
+
+class AccountMembership(Base):
+    __tablename__ = "account_memberships"
+    __table_args__ = (UniqueConstraint("user_id", "tenant_id", name="uq_account_memberships_user_tenant"),)
+
+    id = Column(UNIQUEIDENTIFIER, primary_key=True, default=uuid_str)
+    user_id = Column(UNIQUEIDENTIFIER, ForeignKey("users.id"), nullable=False)
+    tenant_id = Column(UNIQUEIDENTIFIER, ForeignKey("tenants.id"), nullable=False)
+
+    role = Column(Enum(UserRole), nullable=False, server_default="user")
+    is_active = Column(Boolean, nullable=False, server_default="1")
+    ai_enabled = Column(Boolean, nullable=False, server_default="1")
+    confirm_file_delete = Column(Boolean, nullable=False, server_default="1")
+    recycle_bin_retention_days = Column(Integer, nullable=False, server_default="30")
+    theme_preference = Column(String(10), nullable=False, server_default="light")
+
+    last_accessed_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.sysutcdatetime())
+
+
+class UserInvite(Base):
+    __tablename__ = "user_invites"
+
+    id = Column(UNIQUEIDENTIFIER, primary_key=True, default=uuid_str)
+    tenant_id = Column(UNIQUEIDENTIFIER, ForeignKey("tenants.id"), nullable=False)
+    email = Column(String(255), nullable=False)
+    token_hash = Column(String(64), nullable=False, unique=True)
+    invited_by = Column(UNIQUEIDENTIFIER, ForeignKey("users.id"), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    accepted_at = Column(DateTime(timezone=True))
+    revoked_at = Column(DateTime(timezone=True))
+    last_sent_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.sysutcdatetime())
+
+
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+
+    id = Column(UNIQUEIDENTIFIER, primary_key=True, default=uuid_str)
+    user_id = Column(UNIQUEIDENTIFIER, ForeignKey("users.id"), nullable=False)
+    token_hash = Column(String(64), nullable=False, unique=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.sysutcdatetime())
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(UNIQUEIDENTIFIER, primary_key=True, default=uuid_str)
+    tenant_id = Column(UNIQUEIDENTIFIER, ForeignKey("tenants.id"), nullable=False)
+    actor_user_id = Column(UNIQUEIDENTIFIER, ForeignKey("users.id"))
+    action = Column(String(100), nullable=False)
+    target_type = Column(String(50), nullable=False)
+    target_id = Column(String(255))
+    details_json = Column(Text)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.sysutcdatetime())
 
 
@@ -71,6 +133,10 @@ class File(Base):
     status = Column(String(30), nullable=False, server_default="uploaded")
 
     uploaded_at = Column(DateTime(timezone=True), nullable=False, server_default=func.sysutcdatetime())
+    deleted_at = Column(DateTime(timezone=True))
+    deleted_by = Column(UNIQUEIDENTIFIER, ForeignKey("users.id"))
+    purge_after = Column(DateTime(timezone=True))
+    restore_blob_path = Column(String(500))
 
 
 class SavedReport(Base):

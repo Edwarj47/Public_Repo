@@ -7,12 +7,30 @@ export interface TokenResponse {
   token_type: string;
 }
 
+export interface AccountSummary {
+  membership_id: string;
+  account_id: string;
+  account_name: string;
+  role: "owner" | "admin" | "user";
+}
+
+export interface LoginResponse {
+  requires_account_selection: boolean;
+  account_selection_token?: string | null;
+  accounts: AccountSummary[];
+  access_token?: string | null;
+  refresh_token?: string | null;
+  token_type: string;
+}
+
 export interface MeResponse {
   id: string;
   email: string;
   tenant_id: string;
-  role: "admin" | "user";
+  role: "owner" | "admin" | "user";
   ai_enabled: boolean;
+  active_account: AccountSummary;
+  available_accounts: AccountSummary[];
 }
 
 export interface FileItem {
@@ -21,12 +39,13 @@ export interface FileItem {
   uploaded_at: string;
   status: string;
   size_bytes: number | null;
+  uploaded_by_email?: string | null;
 }
 
 async function handleJson<T>(res: Response): Promise<T> {
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(text || `HTTP ${res.status}`);
+    const body = await res.json().catch(() => null) as { detail?: string } | null;
+    throw new Error(body?.detail || `HTTP ${res.status}`);
   }
   return res.json() as Promise<T>;
 }
@@ -36,20 +55,20 @@ async function handleJson<T>(res: Response): Promise<T> {
 export async function apiLogin(
   email: string,
   password: string
-): Promise<TokenResponse> {
+): Promise<LoginResponse> {
   const res = await fetch(`${API_BASE_URL}/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ email, password }),
   });
-  return handleJson<TokenResponse>(res);
+  return handleJson<LoginResponse>(res);
 }
 
 export async function apiRegister(
   email: string,
   password: string,
   tenant_name: string
-): Promise<TokenResponse> {
+): Promise<LoginResponse> {
   const res = await fetch(`${API_BASE_URL}/auth/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -58,6 +77,48 @@ export async function apiRegister(
       password,
       tenant_name,
     }),
+  });
+  return handleJson<LoginResponse>(res);
+}
+
+export async function apiSelectAccount(
+  account_selection_token: string,
+  membership_id: string
+): Promise<TokenResponse> {
+  const res = await fetch(`${API_BASE_URL}/auth/select-account`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ account_selection_token, membership_id }),
+  });
+  return handleJson<TokenResponse>(res);
+}
+
+export async function apiSwitchAccount(
+  accessToken: string,
+  membership_id: string
+): Promise<TokenResponse> {
+  const res = await fetch(`${API_BASE_URL}/auth/switch-account`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ membership_id }),
+  });
+  return handleJson<TokenResponse>(res);
+}
+
+export async function apiCreateAccount(
+  accessToken: string,
+  account_name: string
+): Promise<TokenResponse> {
+  const res = await fetch(`${API_BASE_URL}/auth/accounts`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ account_name }),
   });
   return handleJson<TokenResponse>(res);
 }

@@ -81,10 +81,25 @@ jobs:
           containerAppName: ${{ env.CONTAINER_APP_NAME }}
           imageToDeploy: ${{ env.FULL_IMAGE }}
           targetPort: ${{ env.TARGET_PORT }}
-          
 
       # -------------------------
-      # 8) Route 100% traffic to latest revision
+      # 8) Bind existing ACA secrets and email settings
+      # -------------------------
+      - name: Set backend environment variables
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az containerapp update \
+              --resource-group "${{ env.RESOURCE_GROUP }}" \
+              --name "${{ env.CONTAINER_APP_NAME }}" \
+              --set-env-vars \
+                ACS_CONNECTION_STRING=secretref:acs-connection-string \
+                SMTP_FROM_EMAIL=DoNotReply@beamdataservices.com \
+                FRONTEND_BASE_URL=http://localhost:3000 \
+                EMAIL_LOGO_URL=https://beamanalyticsstg.blob.core.windows.net/photos-beam/New%20Full%20BEAM%20logo%2005-13-2026.png
+
+      # -------------------------
+      # 9) Route 100% traffic to latest revision
       # -------------------------
       - name: Route 100% traffic to latest revision
         uses: azure/cli@v2

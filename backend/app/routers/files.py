@@ -4,7 +4,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from uuid import uuid4, UUID
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import math
 import io
@@ -14,13 +14,14 @@ import numpy as np
 import plotly.express as px
 from urllib.parse import quote
 
+from azure.core.exceptions import ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.deps import get_db
 from app.auth import get_current_user
-from app.models import File as FileModel, User
+from app.models import File as FileModel, Tenant, User
 
 router = APIRouter()
 
@@ -45,10 +46,16 @@ class FileOut(BaseModel):
     uploaded_at: datetime
     status: str
     size_bytes: int | None
+    uploaded_by_email: str | None = None
     workbook: Optional[Dict[str, Any]] = None
 
     class Config:
         orm_mode = True
+
+
+class RecycleBinFileOut(FileOut):
+    deleted_at: datetime
+    purge_after: datetime
 
 
 class TopValue(BaseModel):
@@ -130,6 +137,54 @@ def _content_disposition_attachment(filename: str) -> str:
     return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
 
 
+def _safe_blob_segment(value: str, fallback: str, max_length: int = 180) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._@+-]", "_", str(value or "")).strip("._")
+    return (safe or fallback)[:max_length]
+
+
+def _active_blob_path(user: User, tenant: Tenant, file_id: str, filename: str, file_type: str) -> str:
+    tenant_segment = f"{_safe_blob_segment(tenant.slug or tenant.name, 'tenant', 80)}_{user.tenant_id}"
+    user_segment = f"{_safe_blob_segment(user.email, 'user', 100)}_{user.id}"
+    filename_segment = _safe_blob_segment(filename, f"file.{file_type}", 160)
+    return f"tenants/{tenant_segment}/users/{user_segment}/files/{file_type}/file_{file_id}/{filename_segment}"
+
+
+def _recycle_blob_path(file: FileModel) -> str:
+    return f"recycle-bin/{file.blob_path}"
+
+
+def _move_blob(source_path: str, destination_path: str) -> None:
+    if source_path == destination_path:
+        return
+    source = container_client.get_blob_client(source_path)
+    destination = container_client.get_blob_client(destination_path)
+    destination.upload_blob(source.download_blob().readall(), overwrite=True)
+    source.delete_blob()
+
+
+def _purge_expired_files(db: Session, user: User) -> None:
+    expired = (
+        db.query(FileModel)
+        .filter(
+            FileModel.tenant_id == user.tenant_id,
+            FileModel.deleted_by == user.id,
+            FileModel.deleted_at.is_not(None),
+            FileModel.status == "deleted",
+            FileModel.purge_after <= datetime.utcnow(),
+        )
+        .all()
+    )
+    for file in expired:
+        try:
+            container_client.get_blob_client(file.blob_path).delete_blob()
+        except Exception:
+            pass
+        file.status = "purged"
+        file.restore_blob_path = None
+    if expired:
+        db.commit()
+
+
 def _extract_workbook_metadata(filename: str, data: bytes) -> Optional[Dict[str, Any]]:
     name_lc = (filename or "").lower()
     if not (name_lc.endswith(".xlsx") or name_lc.endswith(".xls")):
@@ -164,6 +219,30 @@ def _file_out_with_workbook(file: FileModel) -> FileOut:
         status=file.status,
         size_bytes=file.size_bytes,
         workbook=workbook,
+    )
+
+
+def _file_out(file: FileModel, uploaded_by_email: str | None = None) -> FileOut:
+    return FileOut(
+        id=file.id,
+        original_name=file.original_name,
+        uploaded_at=file.uploaded_at,
+        status=file.status,
+        size_bytes=file.size_bytes,
+        uploaded_by_email=uploaded_by_email,
+    )
+
+
+def _recycle_file_out(file: FileModel, uploaded_by_email: str | None = None) -> RecycleBinFileOut:
+    return RecycleBinFileOut(
+        id=file.id,
+        original_name=file.original_name,
+        uploaded_at=file.uploaded_at,
+        status=file.status,
+        size_bytes=file.size_bytes,
+        uploaded_by_email=uploaded_by_email,
+        deleted_at=file.deleted_at,
+        purge_after=file.purge_after,
     )
 
 
@@ -280,7 +359,11 @@ async def upload_file(
         )
 
     file_id = str(uuid4())
-    blob_path = f"tenant_{user.tenant_id}/file_{file_id}/raw/{uploaded_file.filename}"
+    tenant = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    file_type = "csv" if uploaded_file.filename.lower().endswith(".csv") else "xlsx"
+    blob_path = _active_blob_path(user, tenant, file_id, uploaded_file.filename, file_type)
 
     try:
         container_client.get_blob_client(blob_path).upload_blob(data, overwrite=True)
@@ -293,7 +376,7 @@ async def upload_file(
         uploaded_by=user.id,
         original_name=uploaded_file.filename,
         blob_path=blob_path,
-        file_type="csv" if uploaded_file.filename.lower().endswith(".csv") else "xlsx",
+        file_type=file_type,
         size_bytes=len(data),
         status="uploaded",
         uploaded_at=datetime.utcnow(),
@@ -301,24 +384,130 @@ async def upload_file(
     db.add(db_file)
     db.commit()
     db.refresh(db_file)
-    return db_file
+    return _file_out(db_file, user.email)
 
 
 @router.get("/", response_model=List[FileOut])
 def list_files(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    return (
-        db.query(FileModel)
-        .filter(FileModel.tenant_id == user.tenant_id)
+    _purge_expired_files(db, user)
+    rows = (
+        db.query(FileModel, User.email)
+        .join(User, FileModel.uploaded_by == User.id)
+        .filter(FileModel.tenant_id == user.tenant_id, FileModel.deleted_at.is_(None))
         .order_by(FileModel.uploaded_at.desc())
         .all()
     )
+    return [_file_out(file, email) for file, email in rows]
+
+
+@router.get("/recycle-bin/", response_model=List[RecycleBinFileOut])
+def list_recycle_bin(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _purge_expired_files(db, user)
+    rows = (
+        db.query(FileModel, User.email)
+        .join(User, FileModel.uploaded_by == User.id)
+        .filter(
+            FileModel.tenant_id == user.tenant_id,
+            FileModel.deleted_by == user.id,
+            FileModel.deleted_at.is_not(None),
+            FileModel.status == "deleted",
+        )
+        .order_by(FileModel.deleted_at.desc())
+        .all()
+    )
+    return [_recycle_file_out(file, email) for file, email in rows]
+
+
+@router.delete("/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_file(file_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    file = (
+        db.query(FileModel)
+        .filter(FileModel.id == file_id, FileModel.tenant_id == user.tenant_id, FileModel.deleted_at.is_(None))
+        .first()
+    )
+    if not file:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+
+    now = datetime.utcnow()
+    file.deleted_at = now
+    file.deleted_by = user.id
+    file.purge_after = now + timedelta(days=int(user.recycle_bin_retention_days or 30))
+    file.restore_blob_path = file.blob_path
+    recycle_path = _recycle_blob_path(file)
+    try:
+        _move_blob(file.blob_path, recycle_path)
+    except Exception as ex:
+        raise HTTPException(status_code=500, detail=f"Could not move file to recycle bin: {ex}")
+    file.blob_path = recycle_path
+    file.status = "deleted"
+    db.commit()
+
+
+@router.post("/recycle-bin/{file_id}/restore", response_model=FileOut)
+def restore_file(file_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    file = (
+        db.query(FileModel)
+        .filter(
+            FileModel.id == file_id,
+            FileModel.tenant_id == user.tenant_id,
+            FileModel.deleted_by == user.id,
+            FileModel.deleted_at.is_not(None),
+            FileModel.status == "deleted",
+            FileModel.purge_after > datetime.utcnow(),
+        )
+        .first()
+    )
+    if not file or not file.restore_blob_path:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deleted file not found")
+    try:
+        _move_blob(file.blob_path, file.restore_blob_path)
+    except Exception as ex:
+        raise HTTPException(status_code=500, detail=f"Could not restore file: {ex}")
+    file.blob_path = file.restore_blob_path
+    file.restore_blob_path = None
+    file.deleted_at = None
+    file.deleted_by = None
+    file.purge_after = None
+    file.status = "uploaded"
+    db.commit()
+    db.refresh(file)
+    return file
+
+
+@router.delete("/recycle-bin/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
+def permanently_delete_file(file_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    file = (
+        db.query(FileModel)
+        .filter(
+            FileModel.id == file_id,
+            FileModel.tenant_id == user.tenant_id,
+            FileModel.deleted_by == user.id,
+            FileModel.deleted_at.is_not(None),
+            FileModel.status == "deleted",
+        )
+        .first()
+    )
+    if not file:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deleted file not found")
+
+    try:
+        container_client.get_blob_client(file.blob_path).delete_blob()
+    except ResourceNotFoundError:
+        pass
+    except Exception as ex:
+        raise HTTPException(status_code=500, detail=f"Could not permanently delete file: {ex}")
+
+    file.status = "purged"
+    file.restore_blob_path = None
+    file.purge_after = None
+    db.commit()
 
 
 @router.get("/{file_id}", response_model=FileOut)
 def get_file(file_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     file = (
         db.query(FileModel)
-        .filter(FileModel.id == file_id, FileModel.tenant_id == user.tenant_id)
+        .filter(FileModel.id == file_id, FileModel.tenant_id == user.tenant_id, FileModel.deleted_at.is_(None))
         .first()
     )
     if not file:
@@ -331,7 +520,7 @@ def get_file(file_id: str, db: Session = Depends(get_db), user: User = Depends(g
 def download_file(file_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     file = (
         db.query(FileModel)
-        .filter(FileModel.id == file_id, FileModel.tenant_id == user.tenant_id)
+        .filter(FileModel.id == file_id, FileModel.tenant_id == user.tenant_id, FileModel.deleted_at.is_(None))
         .first()
     )
     if not file:
@@ -370,7 +559,7 @@ def file_insights(
 ):
     file = (
         db.query(FileModel)
-        .filter(FileModel.id == file_id, FileModel.tenant_id == user.tenant_id)
+        .filter(FileModel.id == file_id, FileModel.tenant_id == user.tenant_id, FileModel.deleted_at.is_(None))
         .first()
     )
     if not file:
@@ -415,7 +604,7 @@ def file_health(
 ):
     file = (
         db.query(FileModel)
-        .filter(FileModel.id == file_id, FileModel.tenant_id == user.tenant_id)
+        .filter(FileModel.id == file_id, FileModel.tenant_id == user.tenant_id, FileModel.deleted_at.is_(None))
         .first()
     )
     if not file:
@@ -919,7 +1108,7 @@ def build_custom_charts(
 ):
     file = (
         db.query(FileModel)
-        .filter(FileModel.id == file_id, FileModel.tenant_id == user.tenant_id)
+        .filter(FileModel.id == file_id, FileModel.tenant_id == user.tenant_id, FileModel.deleted_at.is_(None))
         .first()
     )
     if not file:
@@ -939,3 +1128,94 @@ def build_custom_charts(
             charts_out[req.id] = result
 
     return {"charts": charts_out}
+
+
+# ---------------------------------------------------------------------------
+# Dedupe
+# ---------------------------------------------------------------------------
+
+class DedupeIn(BaseModel):
+    mode: str = "full_row"          # "full_row" | "columns"
+    columns: List[str] = []         # only used when mode == "columns"
+    keep: str = "first"             # "first" | "last"
+    sheet_name: Optional[str] = None
+
+
+class DedupePreviewOut(BaseModel):
+    original_rows: int
+    duplicate_count: int
+    cleaned_rows: int
+    pct_removed: float
+
+
+def _run_dedupe(df: pd.DataFrame, payload: DedupeIn) -> pd.DataFrame:
+    keep = payload.keep if payload.keep in ("first", "last") else "first"
+    if payload.mode == "columns" and payload.columns:
+        valid_cols = [c for c in payload.columns if c in df.columns]
+        if not valid_cols:
+            raise HTTPException(status_code=422, detail="None of the specified columns exist in this file.")
+        return df.drop_duplicates(subset=valid_cols, keep=keep)
+    return df.drop_duplicates(keep=keep)
+
+
+@router.post("/{file_id}/dedupe/preview", response_model=DedupePreviewOut)
+def dedupe_preview(
+    file_id: str,
+    payload: DedupeIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    file = (
+        db.query(FileModel)
+        .filter(FileModel.id == file_id, FileModel.tenant_id == user.tenant_id, FileModel.deleted_at.is_(None))
+        .first()
+    )
+    if not file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    df = _load_dataframe_from_blob(file, sheet_name=payload.sheet_name)
+    cleaned = _run_dedupe(df, payload)
+
+    original_rows = len(df)
+    cleaned_rows = len(cleaned)
+    duplicate_count = original_rows - cleaned_rows
+    pct_removed = round((duplicate_count / original_rows * 100) if original_rows > 0 else 0.0, 2)
+
+    return DedupePreviewOut(
+        original_rows=original_rows,
+        duplicate_count=duplicate_count,
+        cleaned_rows=cleaned_rows,
+        pct_removed=pct_removed,
+    )
+
+
+@router.post("/{file_id}/dedupe/download")
+def dedupe_download(
+    file_id: str,
+    payload: DedupeIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    file = (
+        db.query(FileModel)
+        .filter(FileModel.id == file_id, FileModel.tenant_id == user.tenant_id, FileModel.deleted_at.is_(None))
+        .first()
+    )
+    if not file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    df = _load_dataframe_from_blob(file, sheet_name=payload.sheet_name)
+    cleaned = _run_dedupe(df, payload)
+
+    base = file.original_name.rsplit(".", 1)[0] if "." in file.original_name else file.original_name
+    download_name = f"{base}_deduped.csv"
+
+    buf = io.StringIO()
+    cleaned.to_csv(buf, index=False)
+    buf.seek(0)
+
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": _content_disposition_attachment(download_name)},
+    )
