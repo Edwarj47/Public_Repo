@@ -7,7 +7,7 @@ Flow per request:
   3. Specialist agent streams tokens directly to the client
   4. Log LLM usage at end of stream
 
-The orchestrator is intentionally lightweight — it adds ~300ms before the first
+The orchestrator is intentionally lightweight - it adds ~300ms before the first
 token arrives, which is acceptable given that users see the agent label appear
 before the response begins.
 """
@@ -159,16 +159,31 @@ def chat_with_file(
             )
             yield _sse({"type": "routing", "agents": agents})
 
-            # ── Step 2: Build specialist messages ────────────────────────────
+            # ── Step 2: Profile the actual data ──────────────────────────────
+            # Load the dataframe server-side (cached for 5 min) so specialists
+            # can answer questions about real values instead of deflecting.
+            # Best-effort: chat still works without it if the blob load fails.
+            data_profile = ""
+            if agents[0] != "app_guide":
+                try:
+                    from app.routers.files import _load_dataframe_from_blob
+                    from app.agents.data_profile import build_data_profile
+                    df = _load_dataframe_from_blob(file, payload.context.sheet_name)
+                    data_profile = build_data_profile(df)
+                except Exception:
+                    data_profile = ""
+
+            # ── Step 3: Build specialist messages ────────────────────────────
             messages = build_specialist_messages(
                 agents=agents,
                 message=payload.message,
                 context=context_dict,
                 history=history_list,
                 file_name=file.original_name,
+                data_profile=data_profile,
             )
 
-            # ── Step 3: Stream specialist response ───────────────────────────
+            # ── Step 4: Stream specialist response ───────────────────────────
             with client.chat.completions.create(
                 model=model,
                 messages=messages,
@@ -219,7 +234,7 @@ def chat_with_file(
 
 
 # ---------------------------------------------------------------------------
-# Explain issue endpoint (no orchestrator — intent is known)
+# Explain issue endpoint (no orchestrator - intent is known)
 # ---------------------------------------------------------------------------
 
 @router.post("/{file_id}/explain-issue")
@@ -317,7 +332,7 @@ def explain_issue(
 
 
 # ---------------------------------------------------------------------------
-# Action plan endpoint (no orchestrator — intent is known)
+# Action plan endpoint (no orchestrator - intent is known)
 # ---------------------------------------------------------------------------
 
 @router.post("/{file_id}/action-plan")
@@ -413,7 +428,7 @@ def action_plan(
 
 
 # ---------------------------------------------------------------------------
-# Chart narrative endpoint (no orchestrator — intent is known)
+# Chart narrative endpoint (no orchestrator - intent is known)
 # ---------------------------------------------------------------------------
 
 @router.post("/{file_id}/chart-narrative")

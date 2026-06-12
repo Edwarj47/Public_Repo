@@ -165,6 +165,10 @@ function inferChartTypeFromKey(key: string): string {
   return "bar";
 }
 
+// Session cache for AI chart narratives, keyed by chart identity + data, so
+// re-opening a narrative doesn't repeat the API call (and its cost).
+const narrativeCache = new Map<string, string>();
+
 function OverviewChartCard({
   chartKey,
   fig,
@@ -185,8 +189,21 @@ function OverviewChartCard({
   const title = formatChartName(chartKey);
   const chartType = inferChartTypeFromKey(chartKey);
 
-  function handleNarrate() {
+  function handleNarrate(forceRefresh = false) {
     if (narrateState === "loading") return;
+
+    const dataSummary = extractDataSummary(fig);
+    const cacheKey = `${fileId}::${chartKey}::${dataSummary}`;
+
+    if (!forceRefresh) {
+      const cached = narrativeCache.get(cacheKey);
+      if (cached) {
+        setNarrative(cached);
+        setNarrateState("done");
+        return;
+      }
+    }
+
     setNarrative("");
     setNarrateState("loading");
 
@@ -205,13 +222,19 @@ function OverviewChartCard({
     const xLabel = getAxisTitle(fig.layout?.xaxis);
     const yLabel = getAxisTitle(fig.layout?.yaxis);
 
+    let streamed = "";
+    let hadError = false;
+
     streamSSE(
       `${API_BASE_URL}/api/files/${fileId}/chart-narrative`,
-      { chart_title: title, chart_type: chartType, x_label: xLabel, y_label: yLabel, agg: "", data_summary: extractDataSummary(fig) },
+      { chart_title: title, chart_type: chartType, x_label: xLabel, y_label: yLabel, agg: "", data_summary: dataSummary },
       token,
-      (text) => setNarrative((prev) => prev + text),
-      (msg) => { setNarrative(msg); setNarrateState("error"); },
-      () => setNarrateState((s) => s !== "error" ? "done" : "error"),
+      (text) => { streamed += text; setNarrative((prev) => prev + text); },
+      (msg) => { hadError = true; setNarrative(msg); setNarrateState("error"); },
+      () => {
+        setNarrateState((s) => s !== "error" ? "done" : "error");
+        if (!hadError && streamed) narrativeCache.set(cacheKey, streamed);
+      },
       controller.signal,
     );
   }
@@ -223,37 +246,29 @@ function OverviewChartCard({
   }
 
   return (
-    <div className="rounded-xl border border-[var(--border)] bg-[color:var(--bg-panel)] p-5">
-      <div className="flex items-center justify-between gap-3 mb-3">
-        <h3 className="text-sm font-semibold text-[var(--text-main)]">{title}</h3>
+    <div className="card p-5">
+      <div className="flex items-center justify-between gap-3 mb-4">
+        <h3 className="text-sm font-semibold text-[var(--text-main)] tracking-tight">{title}</h3>
         <div className="flex items-center gap-2 shrink-0">
           {narrateState === "idle" && (
-            <button
-              type="button"
-              onClick={handleNarrate}
-              className="text-xs text-cyan-400 hover:text-cyan-300 border border-cyan-500/30 hover:border-cyan-400/60 rounded-lg px-2.5 py-1 transition-colors"
-            >
+            <button type="button" onClick={() => handleNarrate()} className="btn btn-accent-outline btn-sm">
               ✦ Narrate
             </button>
           )}
           {narrateState === "loading" && (
-            <span className="text-xs text-[var(--text-muted)] animate-pulse">Analysing…</span>
+            <span className="text-xs text-[var(--text-muted)] animate-pulse">Analyzing…</span>
           )}
           {(narrateState === "done" || narrateState === "error") && (
             <button
               type="button"
-              onClick={narrateState === "done" ? handleNarrate : handleDismiss}
-              className="text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors"
+              onClick={narrateState === "done" ? () => handleNarrate(true) : handleDismiss}
+              className="btn btn-ghost btn-sm"
             >
               {narrateState === "done" ? "Refresh" : "Dismiss"}
             </button>
           )}
           {narrateState === "done" && (
-            <button
-              type="button"
-              onClick={handleDismiss}
-              className="text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors"
-            >
+            <button type="button" onClick={handleDismiss} className="btn btn-ghost btn-sm">
               Hide
             </button>
           )}
@@ -273,12 +288,19 @@ function OverviewChartCard({
               ...(fig.layout?.xaxis || {}),
               gridcolor: plotTheme.gridColor,
               zerolinecolor: plotTheme.gridColor,
+              linecolor: plotTheme.gridColor,
+              tickfont: { color: plotTheme.fontColor, size: 11 },
+              title: { font: { color: plotTheme.fontColor, size: 12 } },
             },
             yaxis: {
               ...(fig.layout?.yaxis || {}),
               gridcolor: plotTheme.gridColor,
               zerolinecolor: plotTheme.gridColor,
+              linecolor: plotTheme.gridColor,
+              tickfont: { color: plotTheme.fontColor, size: 11 },
+              title: { font: { color: plotTheme.fontColor, size: 12 } },
             },
+            legend: { ...(fig.layout?.legend || {}), font: { color: plotTheme.fontColor, size: 11 } },
           }}
           config={{
             responsive: true,
@@ -290,16 +312,25 @@ function OverviewChartCard({
       </div>
 
       {narrateState !== "idle" && (
-        <div className={`mt-3 rounded-lg border px-3 py-2.5 text-sm leading-relaxed ${
-          narrateState === "error"
-            ? "border-red-500/30 bg-red-950/20 text-red-300"
-            : "border-cyan-500/20 bg-cyan-950/20 text-[var(--text-main)]"
-        }`}>
-          <p className="text-xs font-semibold text-cyan-400 mb-1">✦ AI Narrative</p>
+        <div
+          className="mt-3 rounded-[var(--radius-sm)] border px-3 py-2.5 text-sm leading-relaxed"
+          style={
+            narrateState === "error"
+              ? { background: "var(--error-bg)", borderColor: "var(--error-border)", color: "var(--error-fg)" }
+              : { background: "var(--info-bg)", borderColor: "var(--info-border)", color: "var(--text-main)" }
+          }
+        >
+          <p className="mb-1 text-xs font-semibold" style={{ color: "var(--info-fg)" }}>
+            ✦ AI Narrative
+          </p>
           {narrateState === "loading" && !narrative && (
             <span className="inline-flex gap-1 items-center h-4">
               {[0, 1, 2].map((i) => (
-                <span key={i} className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-bounce" style={{ animationDelay: `${i * 0.15}s` }} />
+                <span
+                  key={i}
+                  className="w-1.5 h-1.5 rounded-full animate-bounce"
+                  style={{ animationDelay: `${i * 0.15}s`, background: "var(--info-fg)" }}
+                />
               ))}
             </span>
           )}
@@ -347,17 +378,18 @@ export default function FileInsightsPage() {
   }, [hasToken, fileId, tokens]);
 
   const plotTheme = useMemo(() => {
-    if (typeof document === "undefined") {
-      return { fontColor: "#e2e8f0", gridColor: "rgba(226, 232, 240, 0.12)" };
-    }
+    // Fall back to per-theme values during SSR; on the client, read the
+    // chart tokens so Plotly tracks the active theme exactly.
+    const fallback =
+      theme === "dark"
+        ? { fontColor: "#d0d8e8", gridColor: "rgba(168, 185, 214, 0.18)" }
+        : { fontColor: "#2d3a52", gridColor: "rgba(16, 24, 40, 0.12)" };
+    if (typeof document === "undefined") return fallback;
 
     const styles = getComputedStyle(document.documentElement);
-    const textMain = styles.getPropertyValue("--text-main").trim() || "#e2e8f0";
     return {
-      fontColor: textMain,
-      gridColor: theme === "dark"
-        ? "rgba(226, 232, 240, 0.12)"
-        : "rgba(15, 23, 42, 0.12)",
+      fontColor: styles.getPropertyValue("--chart-text").trim() || fallback.fontColor,
+      gridColor: styles.getPropertyValue("--chart-grid").trim() || fallback.gridColor,
     };
   }, [theme]);
 
@@ -429,7 +461,7 @@ export default function FileInsightsPage() {
 
   if (!hasToken) {
     return (
-      <div className="px-6 py-6 text-sm text-red-400">
+      <div className="px-6 py-6 text-sm" style={{ color: "var(--error-fg)" }}>
         You must be signed in to view this page.
       </div>
     );
@@ -495,11 +527,11 @@ export default function FileInsightsPage() {
       <main className="flex-1 overflow-y-auto px-6 py-6 space-y-6">
         <header className="flex items-start justify-between gap-4">
           <div className="min-w-0">
-            <h1 className="text-xl font-semibold text-[var(--text-main)] truncate">
+            <h1 className="text-2xl font-bold tracking-tight text-[var(--text-main)] truncate leading-snug">
               {fileTitle}
             </h1>
             {fileSubtitle && (
-              <p className="mt-0.5 text-xs text-[var(--text-muted)]">{fileSubtitle}</p>
+              <p className="mt-1 text-xs text-[var(--text-muted)] font-medium">{fileSubtitle}</p>
             )}
           </div>
 
@@ -515,7 +547,7 @@ export default function FileInsightsPage() {
                       setFiltersState({});
                       setSelectedSheet(e.target.value || null);
                     }}
-                    className="rounded-md border border-[var(--border)] bg-[color:var(--bg-panel)] px-2 py-1.5 text-xs text-[var(--text-main)]"
+                    className="input w-auto px-2 py-1.5 text-xs"
                   >
                     {(workbook?.sheet_names ?? []).map((sheet) => (
                       <option key={sheet} value={sheet}>
@@ -529,7 +561,7 @@ export default function FileInsightsPage() {
               <button
                 onClick={fetchInsights}
                 disabled={loadingInsights}
-                className="shrink-0 rounded-md border border-[var(--border)] px-3 py-1.5 text-xs text-[var(--text-main)] hover:bg-[color:var(--bg-panel-2)] disabled:opacity-60"
+                className="btn btn-secondary btn-sm shrink-0"
                 type="button"
               >
                 {loadingInsights ? "Refreshing..." : "Refresh"}
@@ -538,24 +570,19 @@ export default function FileInsightsPage() {
           )}
         </header>
 
-        <div className="flex gap-1 border-b border-[var(--border)]">
+        <div className="tab-bar" role="tablist">
           {tabs.map((tab) => (
             <button
               key={tab.id}
               onClick={() => setActiveTab(tab.id)}
               type="button"
-              className={[
-                "relative px-4 py-2 text-sm font-medium rounded-t-md transition-colors",
-                activeTab === tab.id
-                  ? "bg-[color:var(--bg-panel)] text-[var(--text-main)] border border-b-0 border-[var(--border)] -mb-px"
-                  : "text-[var(--text-muted)] hover:text-[var(--text-main)]",
-              ].join(" ")}
+              role="tab"
+              aria-selected={activeTab === tab.id}
+              className="tab-pill"
             >
               {tab.label}
               {tab.badge && activeTab !== tab.id && (
-                <span className="ml-2 inline-block rounded-full bg-cyan-500/20 border border-cyan-500/40 px-1.5 py-0 text-xs font-semibold text-cyan-300 leading-4">
-                  ✓
-                </span>
+                <span className="badge badge-info ml-1.5 px-1.5 leading-4">✓</span>
               )}
             </button>
           ))}
@@ -564,30 +591,54 @@ export default function FileInsightsPage() {
         {activeTab === "overview" && (
           <>
             {loadingInsights && !insights && (
-              <div className="py-12 text-center text-sm text-[var(--text-muted)]">
-                Loading your file...
+              <div className="space-y-6 animate-fade-in">
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                  {[0, 1, 2].map((i) => (
+                    <div key={i} className="card p-5 space-y-3">
+                      <div className="skeleton h-3 w-20 rounded" />
+                      <div className="skeleton h-8 w-28 rounded" />
+                    </div>
+                  ))}
+                </div>
+                <div className="card p-5 space-y-3">
+                  <div className="skeleton h-3 w-16 rounded" />
+                  <div className="skeleton h-[280px] w-full rounded" />
+                </div>
               </div>
             )}
 
             {insightsError && (
-              <div className="rounded-md border border-red-700 bg-red-900/20 px-4 py-2 text-sm text-red-300">
+              <div
+                className="rounded-[var(--radius-sm)] border px-4 py-2 text-sm"
+                style={{
+                  background: "var(--error-bg)",
+                  borderColor: "var(--error-border)",
+                  color: "var(--error-fg)",
+                }}
+                role="alert"
+              >
                 {insightsError}
               </div>
             )}
 
             {kpis && Object.keys(kpis).length > 0 && (
-              <section>
-                <h2 className="mb-3 text-sm font-semibold text-[var(--text-main)]">
+              <section className="animate-fade-up">
+                <h2 className="mb-4 text-xs font-semibold uppercase tracking-widest text-[var(--text-muted)]">
                   Key Metrics
                 </h2>
                 <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                  {Object.entries(kpis).map(([label, value]) => (
+                  {Object.entries(kpis).map(([label, value], i) => (
                     <div
                       key={label}
-                      className="rounded-xl border border-[var(--border)] bg-[color:var(--bg-panel)] p-4"
+                      className="card card-hover p-5 relative overflow-hidden"
+                      style={{ animationDelay: `${i * 50}ms` }}
                     >
-                      <p className="text-xs font-medium text-[var(--text-muted)]">{label}</p>
-                      <p className="mt-2 text-2xl font-semibold text-cyan-300">
+                      <div
+                        className="absolute top-0 left-0 right-0 h-[3px] rounded-t-[var(--radius-md)]"
+                        style={{ background: "var(--gradient-accent)" }}
+                      />
+                      <p className="text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)]">{label}</p>
+                      <p className="mt-2.5 text-3xl font-bold tracking-tight tabular-nums text-[var(--text-main)] leading-none">
                         {typeof value === "number" ? value.toLocaleString() : String(value)}
                       </p>
                     </div>
@@ -597,8 +648,8 @@ export default function FileInsightsPage() {
             )}
 
             {charts && Object.keys(charts).length > 0 && (
-              <section className="space-y-6">
-                <h2 className="text-sm font-semibold text-[var(--text-main)]">Charts</h2>
+              <section className="space-y-6 animate-fade-up-1">
+                <h2 className="text-xs font-semibold uppercase tracking-widest text-[var(--text-muted)]">Charts</h2>
                 {Object.entries(charts).map(([key, fig]) => (
                   <OverviewChartCard
                     key={key}
